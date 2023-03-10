@@ -129,6 +129,7 @@ func createPullSecret(clientset *kubernetes.Clientset, ns *corev1.Namespace, cre
 			return err
 		}
 	}
+
 	var dockercfg string
 	registries := append(gcr_config.DefaultGCRRegistries[:], gcr_config.DefaultARRegistries[:]...)
 	for _, reg := range registries {
@@ -138,6 +139,15 @@ func createPullSecret(clientset *kubernetes.Clientset, ns *corev1.Namespace, cre
 	data := map[string][]byte{
 		".dockercfg": []byte(fmt.Sprintf(`{%s}`, dockercfg)),
 	}
+
+	injectMethod := os.Getenv("INJECTION_METHOD")
+	if !mockToken && injectMethod == "secret" {
+		if creds.JSON == nil {
+			log.Printf("INJECTION_METHOD of secret requires ADC : %s", ns.ObjectMeta.Name)
+		}
+		data["google-app-creds.json"] = creds.JSON
+	}
+
 	secretObj := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: gcpAuth,
@@ -145,6 +155,8 @@ func createPullSecret(clientset *kubernetes.Clientset, ns *corev1.Namespace, cre
 		Data: data,
 		Type: "kubernetes.io/dockercfg",
 	}
+
+	log.Printf("Creating secret. namespace:%s", ns.Name)
 	_, err = secrets.Create(context.TODO(), secretObj, metav1.CreateOptions{})
 	if err != nil {
 		return err
@@ -174,119 +186,139 @@ func mutateHandler(w http.ResponseWriter, r *http.Request) {
 
 	needsCreds := needsEnvVar(pod.Spec.Containers[0], "GOOGLE_APPLICATION_CREDENTIALS")
 
-	// Explicitly and silently exclude the kube-system namespace
-	if pod.ObjectMeta.Namespace != metav1.NamespaceSystem {
-		// Define the volume to mount in
-		v := corev1.Volume{
-			Name: "gcp-creds",
-			VolumeSource: corev1.VolumeSource{
-				HostPath: func() *corev1.HostPathVolumeSource {
-					h := corev1.HostPathVolumeSource{
-						Path: "/var/lib/minikube/google_application_credentials.json",
-						Type: func() *corev1.HostPathType {
-							hpt := corev1.HostPathFile
-							return &hpt
-						}(),
-					}
-					return &h
-				}(),
-			},
-		}
+	if skipNamespace(pod.Namespace) {
+		log.Printf("Skipping setting volumes. namespace:%s", pod.Namespace)
+		return
+	}
 
-		// Mount the volume in
-		mount := corev1.VolumeMount{
-			Name:      "gcp-creds",
-			MountPath: "/google-app-creds.json",
-			ReadOnly:  true,
-		}
+	var volumeSource corev1.VolumeSource
 
-		if needsCreds {
-			// Define the env var
-			e := corev1.EnvVar{
-				Name:  "GOOGLE_APPLICATION_CREDENTIALS",
-				Value: "/google-app-creds.json",
+	injectMethod := os.Getenv("INJECTION_METHOD")
+	if injectMethod == "secret" {
+		volumeSource = corev1.VolumeSource{
+			Secret: func() *corev1.SecretVolumeSource {
+				svs := corev1.SecretVolumeSource{
+					SecretName: gcpAuth,
+				}
+				return &svs
+			}(),
+		}
+	} else {
+		volumeSource = corev1.VolumeSource{
+			HostPath: func() *corev1.HostPathVolumeSource {
+				h := corev1.HostPathVolumeSource{
+					Path: "/var/lib/minikube/google_application_credentials.json",
+					Type: func() *corev1.HostPathType {
+						hpt := corev1.HostPathFile
+						return &hpt
+					}(),
+				}
+				return &h
+			}(),
+		}
+	}
+
+	// Define the volume to mount in
+	v := corev1.Volume{
+		Name:         "gcp-creds",
+		VolumeSource: volumeSource,
+	}
+
+	// Mount the volume in
+	mount := corev1.VolumeMount{
+		Name:      "gcp-creds",
+		MountPath: "/google-app-creds.json",
+		SubPath:   "google-app-creds.json",
+		ReadOnly:  true,
+	}
+
+	if needsCreds {
+		// Define the env var
+		e := corev1.EnvVar{
+			Name:  "GOOGLE_APPLICATION_CREDENTIALS",
+			Value: "/google-app-creds.json",
+		}
+		envVars = append(envVars, e)
+
+		// add the volume in the list of patches
+		addVolume := true
+		for _, vl := range pod.Spec.Volumes {
+			if vl.Name == v.Name {
+				addVolume = false
+				break
 			}
-			envVars = append(envVars, e)
+		}
+		if addVolume {
+			patch = append(patch, patchOperation{
+				Op:    "add",
+				Path:  "/spec/volumes",
+				Value: append(pod.Spec.Volumes, v),
+			})
+		}
+	}
 
-			// add the volume in the list of patches
-			addVolume := true
-			for _, vl := range pod.Spec.Volumes {
-				if vl.Name == v.Name {
-					addVolume = false
-					break
+	// If GOOGLE_CLOUD_PROJECT is set in the VM, set it for all GCP apps.
+	if _, err := os.Stat("/var/lib/minikube/google_cloud_project"); err == nil {
+		project, err := os.ReadFile("/var/lib/minikube/google_cloud_project")
+		if err == nil {
+			// Set the project name for every variant of the project env var
+			for _, a := range projectAliases {
+				if needsEnvVar(pod.Spec.Containers[0], a) {
+					envVars = append(envVars, corev1.EnvVar{
+						Name:  a,
+						Value: string(project),
+					})
 				}
 			}
-			if addVolume {
-				patch = append(patch, patchOperation{
-					Op:    "add",
-					Path:  "/spec/volumes",
-					Value: append(pod.Spec.Volumes, v),
-				})
-			}
 		}
+	}
 
-		// If GOOGLE_CLOUD_PROJECT is set in the VM, set it for all GCP apps.
-		if _, err := os.Stat("/var/lib/minikube/google_cloud_project"); err == nil {
-			project, err := os.ReadFile("/var/lib/minikube/google_cloud_project")
-			if err == nil {
-				// Set the project name for every variant of the project env var
-				for _, a := range projectAliases {
-					if needsEnvVar(pod.Spec.Containers[0], a) {
-						envVars = append(envVars, corev1.EnvVar{
-							Name:  a,
-							Value: string(project),
+	if len(envVars) > 0 {
+		addCredsToContainer := func(containers []corev1.Container, container_uri string) {
+			for i, c := range containers {
+				if needsCreds {
+					if len(c.VolumeMounts) == 0 {
+						patch = append(patch, patchOperation{
+							Op:    "add",
+							Path:  fmt.Sprintf("/spec/%s/%d/volumeMounts", container_uri, i),
+							Value: []corev1.VolumeMount{mount},
 						})
-					}
-				}
-			}
-		}
-
-		if len(envVars) > 0 {
-			addCredsToContainer := func(containers []corev1.Container, container_uri string) {
-				for i, c := range containers {
-					if needsCreds {
-						if len(c.VolumeMounts) == 0 {
+					} else {
+						addMount := true
+						for _, vm := range c.VolumeMounts {
+							if vm.Name == mount.Name {
+								addMount = false
+								break
+							}
+						}
+						if addMount {
 							patch = append(patch, patchOperation{
 								Op:    "add",
 								Path:  fmt.Sprintf("/spec/%s/%d/volumeMounts", container_uri, i),
-								Value: []corev1.VolumeMount{mount},
+								Value: append(c.VolumeMounts, mount),
 							})
-						} else {
-							addMount := true
-							for _, vm := range c.VolumeMounts {
-								if vm.Name == mount.Name {
-									addMount = false
-									break
-								}
-							}
-							if addMount {
-								patch = append(patch, patchOperation{
-									Op:    "add",
-									Path:  fmt.Sprintf("/spec/%s/%d/volumeMounts", container_uri, i),
-									Value: append(c.VolumeMounts, mount),
-								})
-							}
 						}
 					}
-					if len(c.Env) == 0 {
-						patch = append(patch, patchOperation{
-							Op:    "add",
-							Path:  fmt.Sprintf("/spec/%s/%d/env", container_uri, i),
-							Value: envVars,
-						})
-					} else {
-						patch = append(patch, patchOperation{
-							Op:    "add",
-							Path:  fmt.Sprintf("/spec/%s/%d/env", container_uri, i),
-							Value: append(c.Env, envVars...),
-						})
-					}
+				}
+				if len(c.Env) == 0 {
+					patch = append(patch, patchOperation{
+						Op:    "add",
+						Path:  fmt.Sprintf("/spec/%s/%d/env", container_uri, i),
+						Value: envVars,
+					})
+				} else {
+					patch = append(patch, patchOperation{
+						Op:    "add",
+						Path:  fmt.Sprintf("/spec/%s/%d/env", container_uri, i),
+						Value: append(c.Env, envVars...),
+					})
 				}
 			}
-
-			addCredsToContainer(pod.Spec.Containers, "containers")
-			addCredsToContainer(pod.Spec.InitContainers, "initContainers")
 		}
+
+		log.Printf("Injecting environment variables into pod. namespace:%s pod:%s ", pod.Name, pod.Namespace)
+		addCredsToContainer(pod.Spec.Containers, "containers")
+		addCredsToContainer(pod.Spec.InitContainers, "initContainers")
 	}
 
 	writePatch(w, ar, patch)
