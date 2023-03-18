@@ -497,7 +497,11 @@ func main() {
 
 	// go updateTicker() - we don't care about minikube updates
 	go func() {
-		if err := watchNamespaces(); err != nil {
+		for range time.Tick(30 * time.Second) {
+			err := watchNamespaces()
+			if err == nil {
+				break
+			}
 			log.Printf("Failed to watch namespaces, please update minikube and disable/re-enable the gcp-auth addon: %v", err)
 		}
 	}()
