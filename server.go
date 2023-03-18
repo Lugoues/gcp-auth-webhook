@@ -72,6 +72,7 @@ func watchNamespaces() error {
 	if err != nil {
 		return fmt.Errorf("getting cluster config: %v", err)
 	}
+
 	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("getting clientset: %v", err)
@@ -88,6 +89,8 @@ func watchNamespaces() error {
 	if err != nil {
 		return fmt.Errorf("creating namespace watcher: %v", err)
 	}
+
+	log.Print("Namespace watcher successfully started.")
 	for e := range watcher.ResultChan() {
 		ns := e.Object.(*corev1.Namespace)
 		if e.Type == watch.Added {
@@ -424,13 +427,13 @@ func writeResp(w http.ResponseWriter, admissionReview admissionv1.AdmissionRevie
 	admissionReview.Kind = "AdmissionReview"
 	admissionReview.APIVersion = "admission.k8s.io/v1"
 
-	log.Printf("Ready to marshal response ...")
+	// log.Printf("Ready to marshal response ...")
 	resp, err := json.Marshal(admissionReview)
 	if err != nil {
 		log.Printf("Can't encode response: %v", err)
 		http.Error(w, fmt.Sprintf("could not encode response: %v", err), http.StatusInternalServerError)
 	}
-	log.Printf("Ready to write response ...")
+	// log.Printf("Ready to write response ...")
 	if _, err := w.Write(resp); err != nil {
 		log.Printf("Can't write response: %v", err)
 		http.Error(w, fmt.Sprintf("could not write response: %v", err), http.StatusInternalServerError)
@@ -496,13 +499,14 @@ func main() {
 	log.Print("GCP Auth Webhook started!")
 
 	// go updateTicker() - we don't care about minikube updates
+	log.Print("Starting namespace watcher...")
 	go func() {
-		for range time.Tick(30 * time.Second) {
-			err := watchNamespaces()
-			if err == nil {
+		for range time.Tick(5 * time.Second) {
+			if err := watchNamespaces(); err == nil {
 				break
+			} else {
+				log.Printf("Failed to watch namespaces: %v", err)
 			}
-			log.Printf("Failed to watch namespaces, please update minikube and disable/re-enable the gcp-auth addon: %v", err)
 		}
 	}()
 
