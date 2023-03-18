@@ -13,5 +13,5 @@
 # limitations under the License.
 
 FROM gcr.io/distroless/static:nonroot
-COPY gcp-auth-webhook /gcp-auth-webhook
+COPY out/gcp-auth-webhook /gcp-auth-webhook
 ENTRYPOINT ["/gcp-auth-webhook"]
