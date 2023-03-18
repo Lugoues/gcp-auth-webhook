@@ -495,7 +495,7 @@ func updateTicker() {
 func main() {
 	log.Print("GCP Auth Webhook started!")
 
-	go updateTicker()
+	// go updateTicker() - we don't care about minikube updates
 	go func() {
 		if err := watchNamespaces(); err != nil {
 			log.Printf("Failed to watch namespaces, please update minikube and disable/re-enable the gcp-auth addon: %v", err)
